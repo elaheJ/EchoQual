@@ -1,0 +1,85 @@
+# EchoQual Configuration
+# All hyperparameters for the self-supervised quality assessment pipeline
+
+data:
+  dataset_dir: "data/EchoNet-Dynamic"
+  video_dir: "Videos"
+  filelist: "FileList.csv"
+  volume_tracings: "VolumeTracings.csv"
+  max_videos: 500                    # Subset size for rapid prototyping (null = all)
+  split: "TRAIN"                     # Which split to use for building centroids
+  num_frames: 16                     # Frames sampled per clip
+  frame_size: 224                    # Spatial resolution
+  fps_target: null                   # Resample FPS (null = use native)
+
+encoder:
+  backbone: "r3d_18"                 # Options: r3d_18, r2plus1d_18, mc3_18
+  pretrained_imagenet: true          # Initialize from ImageNet/Kinetics weights
+  embedding_dim: 512                 # Final embedding dimension
+  freeze_backbone: false             # Freeze for pure feature extraction
+
+ssl_pretraining:
+  enabled: true                      # Whether to run SSL pretraining
+  method: "simclr"                   # Options: simclr, byol, vicreg
+  epochs: 50
+  batch_size: 16
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  temperature: 0.07                  # InfoNCE temperature
+  projection_dim: 128               # Projection head output dim
+  augmentations:
+    random_crop: true
+    horizontal_flip: true
+    color_jitter: 0.4
+    gaussian_blur: true
+    temporal_shuffle: true           # Echo-specific: shuffle frames as pretext
+    frame_drop_rate: 0.1             # Randomly drop frames
+
+quality_scoring:
+  # Signal 1: View classification confidence
+  view_confidence:
+    enabled: true
+    weight: 0.3
+    method: "entropy"                # Options: max_softmax, entropy, energy
+    num_views: 1                     # EchoNet-Dynamic is single-view (A4C)
+    # For multi-view datasets, this expands to classify across views
+
+  # Signal 2: Embedding density
+  embedding_density:
+    enabled: true
+    weight: 0.4
+    method: "knn"                    # Options: knn, mahalanobis, gmm
+    k: 10                            # k for k-NN density
+    normalize_embeddings: true
+    centroid_estimation: "mean"      # Options: mean, medoid, gmm
+
+  # Signal 3: Vision-language alignment
+  vl_alignment:
+    enabled: true
+    weight: 0.3
+    text_encoder: "sentence-transformers/all-MiniLM-L6-v2"
+    projection_dim: 256              # Joint VL space dimension
+    num_canonical_texts: 5           # Number of canonical descriptions per view
+
+  # Fusion
+  fusion:
+    method: "weighted_sum"           # Options: weighted_sum, rank_aggregation, learned
+    normalize_scores: true           # Min-max normalize each signal before fusion
+
+evaluation:
+  metrics:
+    - spearman_correlation
+    - kendall_tau
+    - auc_binary                     # AUC for good/poor binary classification
+  proxy_ground_truth: "ef_confidence"  # Use EF prediction confidence as proxy
+  ef_threshold_poor: 0.15             # Videos with high EF MAE = likely poor quality
+  visualization: true
+  save_examples: true
+  num_examples: 20                    # Number of best/worst examples to save
+
+output:
+  base_dir: "outputs"
+  embeddings_dir: "embeddings"
+  scores_dir: "scores"
+  figures_dir: "figures"
+  checkpoints_dir: "checkpoints"
