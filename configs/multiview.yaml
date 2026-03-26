@@ -1,0 +1,86 @@
+# EchoQual Multi-View Configuration
+# 2-view proof-of-concept: EchoNet-Dynamic (A4C) + CAMUS (A4C + A2C)
+# Or sample synthetic data for pipeline testing
+
+# --- Data sources ---
+data:
+  # Toggle which sources to use (paths resolved at runtime via --data_sources)
+  sources:
+    echonet:
+      type: "echonet"
+      root_dir: "data/EchoNet-Dynamic"
+      enabled: true
+
+    camus:
+      type: "camus"
+      root_dir: "data/CAMUS"
+      views: ["4CH", "2CH"]
+      enabled: false  # Enable when CAMUS data is available
+
+    sample:
+      type: "multiview"
+      root_dir: "data/sample_multiview"
+      enabled: false  # Enable for pipeline testing with synthetic data
+
+  max_videos_per_source: 500    # Subset for prototyping (null = all)
+  num_frames: 16
+  frame_size: 224
+
+# --- Encoder ---
+encoder:
+  # Options: "echoprime", "r3d_18", "r2plus1d_18", "mc3_18"
+  backbone: "r3d_18"
+  pretrained_imagenet: true
+  embedding_dim: 512
+  freeze_backbone: false
+
+  # EchoPrime-specific (only used when backbone: "echoprime")
+  echoprime_dir: "EchoPrime"   # Path to cloned echonet/EchoPrime repo
+
+# --- SSL Pretraining ---
+ssl_pretraining:
+  enabled: true
+  method: "simclr"
+  epochs: 30                    # Fewer epochs for small-scale
+  batch_size: 8                 # Smaller batch for memory
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  temperature: 0.07
+  projection_dim: 128
+
+# --- Quality Scoring ---
+quality_scoring:
+  view_confidence:
+    enabled: true
+    weight: 0.3
+    method: "entropy"
+    num_views: 5                # PLAX, A3C, A4C, Doppler_A3C, Doppler_PLAX
+
+  embedding_density:
+    enabled: true
+    weight: 0.4
+    method: "knn"
+    k: 10
+    normalize_embeddings: true
+
+  vl_alignment:
+    enabled: true
+    weight: 0.3
+    text_encoder: "sentence-transformers/all-MiniLM-L6-v2"
+
+  fusion:
+    method: "weighted_sum"
+    normalize_scores: true
+
+# --- Evaluation ---
+evaluation:
+  metrics:
+    - spearman_correlation
+    - kendall_tau
+    - auc_binary
+  per_view_metrics: true        # Report metrics per view
+  num_examples: 10
+
+# --- Output ---
+output:
+  base_dir: "outputs/multiview"

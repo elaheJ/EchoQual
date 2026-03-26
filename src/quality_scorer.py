@@ -1,28 +1,18 @@
 """
 Self-supervised quality scoring: three proxy signals + fusion.
+Now VIEW-AWARE: builds per-view centroids and canonical text anchors.
 
-Signal 1: View Classification Confidence
-  - High softmax confidence / low entropy → canonical view → likely high quality
-  - Uses a view classifier trained with SSL pseudo-labels
-
-Signal 2: Embedding Density Scoring
-  - Compute distance to view-specific centroids in embedding space
-  - High-quality images cluster tightly; degraded images are outliers
-  - Methods: k-NN distance, Mahalanobis distance, GMM likelihood
-
-Signal 3: Vision-Language Alignment
-  - Cosine similarity between video embeddings and canonical text descriptions
-  - Higher alignment with "good quality" texts → better quality
-  - Differential: similarity(good) - similarity(poor) for robustness
-
+Signal 1: View Classification Confidence (entropy-based)
+Signal 2: Embedding Density (per-view k-NN / Mahalanobis)
+Signal 3: Vision-Language Alignment (per-view canonical text matching)
 Fusion: weighted combination of normalized scores.
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
+from collections import defaultdict
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from scipy.spatial.distance import mahalanobis
 from sklearn.neighbors import NearestNeighbors
@@ -31,274 +21,199 @@ from sklearn.preprocessing import MinMaxScaler
 
 
 class ViewConfidenceScorer:
-    """
-    Signal 1: Quality proxy from view classification confidence.
-
-    Intuition: A model trained to recognize A4C views will be less confident
-    on poorly acquired images where expected anatomical structures are
-    missing or distorted.
-    """
+    """Signal 1: Quality from view classification confidence."""
 
     def __init__(self, method: str = "entropy"):
-        """
-        Args:
-            method: 'max_softmax', 'entropy', or 'energy'
-        """
         self.method = method
 
     def score(self, logits: torch.Tensor) -> np.ndarray:
-        """
-        Compute confidence score from view classification logits.
-
-        Args:
-            logits: [N, num_classes] raw logits from view classifier
-        Returns:
-            scores: [N] quality scores (higher = better quality)
-        """
         logits = logits.detach().cpu()
-
-        if self.method == "max_softmax":
-            probs = F.softmax(logits, dim=-1)
-            scores = probs.max(dim=-1).values.numpy()
-
-        elif self.method == "entropy":
+        if self.method == "entropy":
             probs = F.softmax(logits, dim=-1)
             entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=-1)
-            # Lower entropy = higher confidence = higher quality
             scores = (1.0 - entropy / np.log(logits.shape[-1])).numpy()
-
+        elif self.method == "max_softmax":
+            scores = F.softmax(logits, dim=-1).max(dim=-1).values.numpy()
         elif self.method == "energy":
-            # Energy-based OOD detection: -T * logsumexp(logits / T)
-            T = 1.0
-            energy = T * torch.logsumexp(logits / T, dim=-1)
-            scores = energy.numpy()  # Higher energy = more in-distribution
-
+            scores = torch.logsumexp(logits, dim=-1).numpy()
         else:
             raise ValueError(f"Unknown method: {self.method}")
-
         return scores
 
 
 class EmbeddingDensityScorer:
     """
-    Signal 2: Quality proxy from embedding space density.
-
-    High-quality images form tight clusters in the learned representation
-    space. Poor-quality images are outliers with high distance to centroids.
+    Signal 2: Per-view embedding density.
+    Builds separate centroids/kNN models per view so that quality is
+    measured relative to same-view neighbors, not cross-view distance.
     """
 
-    def __init__(
-        self,
-        method: str = "knn",
-        k: int = 10,
-        normalize: bool = True,
-    ):
+    def __init__(self, method: str = "knn", k: int = 10, normalize: bool = True):
         self.method = method
         self.k = k
         self.normalize = normalize
-        self.centroid = None
-        self.covariance_inv = None
-        self.knn_model = None
-        self.gmm = None
-        self.reference_embeddings = None
+        self.per_view_models: Dict = {}
+        self.global_model = None
 
-    def fit(self, embeddings: np.ndarray):
-        """
-        Fit density model on reference (training) embeddings.
-
-        Args:
-            embeddings: [N, D] reference embeddings from training set
-        """
+    def _norm(self, emb: np.ndarray) -> np.ndarray:
         if self.normalize:
-            norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-            embeddings = embeddings / (norms + 1e-8)
+            norms = np.linalg.norm(emb, axis=1, keepdims=True)
+            return emb / (norms + 1e-8)
+        return emb
 
-        self.reference_embeddings = embeddings
-        self.centroid = embeddings.mean(axis=0)
-
-        if self.method == "knn":
-            self.knn_model = NearestNeighbors(n_neighbors=self.k, metric="cosine")
-            self.knn_model.fit(embeddings)
-
-        elif self.method == "mahalanobis":
-            cov = np.cov(embeddings.T) + 1e-6 * np.eye(embeddings.shape[1])
-            self.covariance_inv = np.linalg.inv(cov)
-
-        elif self.method == "gmm":
-            self.gmm = GaussianMixture(
-                n_components=min(5, len(embeddings) // 10),
-                covariance_type="full",
-                random_state=42,
-            )
-            self.gmm.fit(embeddings)
-
-    def score(self, embeddings: np.ndarray) -> np.ndarray:
+    def fit(self, embeddings: np.ndarray, views: Optional[List[str]] = None):
         """
-        Compute density-based quality scores.
-
-        Args:
-            embeddings: [N, D] query embeddings
-        Returns:
-            scores: [N] quality scores (higher = closer to distribution = better)
+        Fit density models. If views provided, build per-view models.
+        Falls back to a single global model if views is None.
         """
-        if self.normalize:
-            norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-            embeddings = embeddings / (norms + 1e-8)
+        embeddings = self._norm(embeddings)
 
-        if self.method == "knn":
-            distances, _ = self.knn_model.kneighbors(embeddings)
-            avg_dist = distances.mean(axis=1)
-            # Invert: lower distance = higher quality
-            scores = 1.0 / (1.0 + avg_dist)
+        if views is not None:
+            view_set = sorted(set(views))
+            for v in view_set:
+                mask = np.array([vv == v for vv in views])
+                v_emb = embeddings[mask]
+                if len(v_emb) < max(self.k, 3):
+                    continue
+                model = NearestNeighbors(
+                    n_neighbors=min(self.k, len(v_emb) - 1), metric="cosine"
+                )
+                model.fit(v_emb)
+                self.per_view_models[v] = {
+                    "knn": model,
+                    "centroid": v_emb.mean(axis=0),
+                    "count": len(v_emb),
+                }
+            print(f"  [EmbeddingDensity] Built per-view models for {list(self.per_view_models.keys())}")
 
-        elif self.method == "mahalanobis":
-            scores = np.array([
-                -mahalanobis(emb, self.centroid, self.covariance_inv)
-                for emb in embeddings
-            ])
-            # Negate so higher = better quality
-            scores = -scores
+        # Always build a global fallback
+        k_global = min(self.k, len(embeddings) - 1)
+        self.global_model = NearestNeighbors(n_neighbors=k_global, metric="cosine")
+        self.global_model.fit(embeddings)
+        self.global_centroid = embeddings.mean(axis=0)
 
-        elif self.method == "gmm":
-            log_likelihood = self.gmm.score_samples(embeddings)
-            scores = log_likelihood  # Higher log-likelihood = better quality
+    def score(self, embeddings: np.ndarray, views: Optional[List[str]] = None) -> np.ndarray:
+        embeddings = self._norm(embeddings)
+        scores = np.zeros(len(embeddings))
 
+        if views is not None and self.per_view_models:
+            for i, (emb, v) in enumerate(zip(embeddings, views)):
+                if v in self.per_view_models:
+                    dists, _ = self.per_view_models[v]["knn"].kneighbors(emb.reshape(1, -1))
+                    scores[i] = 1.0 / (1.0 + dists.mean())
+                else:
+                    dists, _ = self.global_model.kneighbors(emb.reshape(1, -1))
+                    scores[i] = 1.0 / (1.0 + dists.mean())
         else:
-            # Fallback: cosine distance to centroid
-            cos_sim = embeddings @ self.centroid / (
-                np.linalg.norm(embeddings, axis=1) * np.linalg.norm(self.centroid) + 1e-8
-            )
-            scores = cos_sim
+            dists, _ = self.global_model.kneighbors(embeddings)
+            scores = 1.0 / (1.0 + dists.mean(axis=1))
 
         return scores
 
 
 class VLAlignmentScorer:
     """
-    Signal 3: Quality proxy from vision-language alignment.
-
-    Measures how well a video embedding aligns with canonical text
-    descriptions of properly acquired views. Uses a differential score:
-    similarity(good_texts) - similarity(poor_texts) for robustness.
+    Signal 3: Per-view vision-language alignment.
+    Each view has its own canonical good/poor text anchors.
     """
 
-    def __init__(
-        self,
-        text_encoder_name: str = "sentence-transformers/all-MiniLM-L6-v2",
-    ):
+    def __init__(self, text_encoder_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
         self.text_encoder_name = text_encoder_name
-        self.good_text_embeddings = None
-        self.poor_text_embeddings = None
         self.text_encoder = None
-        self.video_projection = None
-        self.text_projection = None
+        self.per_view_texts: Dict = {}
 
     def _load_text_encoder(self):
-        """Lazy-load sentence transformer."""
         if self.text_encoder is None:
             try:
                 from sentence_transformers import SentenceTransformer
                 self.text_encoder = SentenceTransformer(self.text_encoder_name)
             except ImportError:
-                print("WARNING: sentence-transformers not available. "
-                      "Using random text embeddings for demonstration.")
+                print("WARNING: sentence-transformers not available. Using random embeddings.")
                 self.text_encoder = None
 
     def encode_texts(self, texts: List[str]) -> np.ndarray:
-        """Encode text descriptions to embeddings."""
         self._load_text_encoder()
         if self.text_encoder is not None:
             return self.text_encoder.encode(texts, normalize_embeddings=True)
         else:
-            # Fallback: deterministic pseudo-random embeddings based on text hash
-            np.random.seed(42)
+            np.random.seed(hash(texts[0]) % 2**31)
             return np.random.randn(len(texts), 384).astype(np.float32)
 
     def fit(
         self,
-        good_texts: List[str],
-        poor_texts: List[str],
+        view_texts: Dict[str, Dict[str, List[str]]],
         video_embeddings: np.ndarray,
-        video_projection: Optional[nn.Module] = None,
     ):
         """
-        Precompute text embeddings and optionally learn projection.
+        Precompute text embeddings for each view.
 
         Args:
-            good_texts: Descriptions of well-acquired views
-            poor_texts: Descriptions of poorly-acquired views
-            video_embeddings: [N, D] training video embeddings for projection alignment
-            video_projection: Optional learned projection layer
+            view_texts: {view_name: {"good": [...], "poor": [...]}}
+            video_embeddings: reference embeddings for PCA alignment
         """
-        self.good_text_embeddings = self.encode_texts(good_texts)
-        self.poor_text_embeddings = self.encode_texts(poor_texts)
-        self.video_projection = video_projection
+        for view, texts in view_texts.items():
+            self.per_view_texts[view] = {
+                "good": self.encode_texts(texts["good"]),
+                "poor": self.encode_texts(texts["poor"]),
+            }
+        print(f"  [VLAlignment] Encoded texts for views: {list(self.per_view_texts.keys())}")
 
-    def score(
-        self,
-        video_embeddings: np.ndarray,
-    ) -> np.ndarray:
-        """
-        Compute VL alignment quality scores.
+        # Store reference embedding dim for projection
+        self._video_dim = video_embeddings.shape[1]
+        self._text_dim = list(self.per_view_texts.values())[0]["good"].shape[1]
 
-        Strategy: Measure cosine similarity between video embeddings and
-        canonical "good" texts, minus similarity to "poor" texts.
+    def score(self, video_embeddings: np.ndarray, views: Optional[List[str]] = None) -> np.ndarray:
+        v_norm = video_embeddings / (np.linalg.norm(video_embeddings, axis=1, keepdims=True) + 1e-8)
 
-        When dimensions mismatch (video vs text), we use a simple linear
-        projection or CKA-style comparison.
-
-        Args:
-            video_embeddings: [N, D_video]
-        Returns:
-            scores: [N] differential alignment scores
-        """
-        # Normalize video embeddings
-        v_norm = video_embeddings / (
-            np.linalg.norm(video_embeddings, axis=1, keepdims=True) + 1e-8
-        )
-
-        if self.good_text_embeddings is None:
-            return np.zeros(len(video_embeddings))
-
-        # If dimensions differ, use PCA alignment or learned projection
-        if v_norm.shape[1] != self.good_text_embeddings.shape[1]:
-            # Simple approach: project both to shared dim via SVD
-            shared_dim = min(v_norm.shape[1], self.good_text_embeddings.shape[1], 128)
-
+        # Handle dimension mismatch with PCA
+        sample_good = list(self.per_view_texts.values())[0]["good"]
+        if v_norm.shape[1] != sample_good.shape[1]:
             from sklearn.decomposition import PCA
-
+            shared_dim = min(v_norm.shape[1], sample_good.shape[1], 128, len(v_norm) - 1)
+            shared_dim = max(shared_dim, 2)
             pca_v = PCA(n_components=shared_dim, random_state=42)
             v_proj = pca_v.fit_transform(v_norm)
-
-            pca_t = PCA(n_components=shared_dim, random_state=42)
-            good_t_proj = pca_t.fit_transform(self.good_text_embeddings)
-            poor_t_proj = pca_t.transform(self.poor_text_embeddings)
+            v_proj = v_proj / (np.linalg.norm(v_proj, axis=1, keepdims=True) + 1e-8)
         else:
             v_proj = v_norm
-            good_t_proj = self.good_text_embeddings
-            poor_t_proj = self.poor_text_embeddings
 
-        # Normalize projections
-        v_proj = v_proj / (np.linalg.norm(v_proj, axis=1, keepdims=True) + 1e-8)
-        good_t_proj = good_t_proj / (np.linalg.norm(good_t_proj, axis=1, keepdims=True) + 1e-8)
-        poor_t_proj = poor_t_proj / (np.linalg.norm(poor_t_proj, axis=1, keepdims=True) + 1e-8)
+        scores = np.zeros(len(video_embeddings))
 
-        # Average similarity to good texts
-        sim_good = (v_proj @ good_t_proj.T).mean(axis=1)
+        for i in range(len(video_embeddings)):
+            view = views[i] if views is not None else None
+            texts = self.per_view_texts.get(view) if view else None
+            if texts is None:
+                # Use first available view's texts as fallback
+                texts = list(self.per_view_texts.values())[0]
 
-        # Average similarity to poor texts
-        sim_poor = (v_proj @ poor_t_proj.T).mean(axis=1)
+            good_t = texts["good"]
+            poor_t = texts["poor"]
 
-        # Differential score
-        scores = sim_good - sim_poor
+            # Match dimensions: truncate to smaller dim for dot product
+            vi = v_proj[i:i+1]
+            d_v = vi.shape[1]
+            d_t = good_t.shape[1]
+            if d_v != d_t:
+                shared = min(d_v, d_t)
+                vi = vi[:, :shared]
+                vi = vi / (np.linalg.norm(vi, axis=1, keepdims=True) + 1e-8)
+                good_t_s = good_t[:, :shared]
+                good_t_s = good_t_s / (np.linalg.norm(good_t_s, axis=1, keepdims=True) + 1e-8)
+                poor_t_s = poor_t[:, :shared]
+                poor_t_s = poor_t_s / (np.linalg.norm(poor_t_s, axis=1, keepdims=True) + 1e-8)
+            else:
+                good_t_s = good_t
+                poor_t_s = poor_t
+
+            sim_good = (vi @ good_t_s.T).mean()
+            sim_poor = (vi @ poor_t_s.T).mean()
+            scores[i] = sim_good - sim_poor
 
         return scores
 
 
 class QualityScoreFusion:
-    """
-    Fuses three quality proxy signals into a single composite score.
-    """
+    """Fuses three quality proxy signals into a composite score."""
 
     def __init__(
         self,
@@ -316,20 +231,11 @@ class QualityScoreFusion:
         self.scalers = {}
 
     def fuse(self, scores: Dict[str, np.ndarray]) -> np.ndarray:
-        """
-        Combine multiple quality signals into a single score.
-
-        Args:
-            scores: Dict mapping signal name to [N] score arrays
-        Returns:
-            composite: [N] fused quality scores
-        """
         normalized = {}
         for name, s in scores.items():
-            if self.normalize:
+            if self.normalize and s.std() > 1e-8:
                 scaler = MinMaxScaler()
-                s_reshaped = s.reshape(-1, 1)
-                s_norm = scaler.fit_transform(s_reshaped).flatten()
+                s_norm = scaler.fit_transform(s.reshape(-1, 1)).flatten()
                 self.scalers[name] = scaler
                 normalized[name] = s_norm
             else:
@@ -340,29 +246,24 @@ class QualityScoreFusion:
             for name, s in normalized.items():
                 w = self.weights.get(name, 1.0 / len(normalized))
                 composite += w * s
-
         elif self.method == "rank_aggregation":
-            # Borda count: rank each signal, average ranks
-            ranks = {}
             N = len(list(normalized.values())[0])
+            ranks = {}
             for name, s in normalized.items():
-                order = np.argsort(-s)  # Descending
+                order = np.argsort(-s)
                 rank = np.empty_like(order)
                 rank[order] = np.arange(N)
                 ranks[name] = rank
-
             avg_rank = np.mean(list(ranks.values()), axis=0)
-            composite = 1.0 - avg_rank / N  # Convert rank to score
-
+            composite = 1.0 - avg_rank / N
         else:
-            raise ValueError(f"Unknown fusion method: {self.method}")
-
+            raise ValueError(f"Unknown fusion: {self.method}")
         return composite
 
 
 class EchoQualityScorer:
     """
-    Main quality scoring class that orchestrates all three signals.
+    Main quality scoring class — view-aware orchestration of all 3 signals.
     """
 
     def __init__(
@@ -377,50 +278,45 @@ class EchoQualityScorer:
         self.view_scorer = ViewConfidenceScorer(method=view_conf_method)
         self.density_scorer = EmbeddingDensityScorer(method=density_method, k=density_k)
         self.vl_scorer = VLAlignmentScorer(text_encoder_name=text_encoder)
-        self.fusion = QualityScoreFusion(
-            weights=fusion_weights, method=fusion_method
-        )
+        self.fusion = QualityScoreFusion(weights=fusion_weights, method=fusion_method)
 
     def fit(
         self,
         reference_embeddings: np.ndarray,
-        good_texts: List[str],
-        poor_texts: List[str],
+        view_texts: Dict[str, Dict[str, List[str]]],
+        views: Optional[List[str]] = None,
     ):
         """
-        Fit scorers on reference (training) data.
-        No quality labels needed — only embeddings and canonical texts.
+        Fit scorers on reference data. No quality labels needed.
+
+        Args:
+            reference_embeddings: [N, D] embeddings from training set
+            view_texts: {view: {"good": [...], "poor": [...]}}
+            views: [N] view labels for per-view density modeling
         """
-        self.density_scorer.fit(reference_embeddings)
-        self.vl_scorer.fit(good_texts, poor_texts, reference_embeddings)
+        print("\nFitting quality scorers...")
+        self.density_scorer.fit(reference_embeddings, views=views)
+        self.vl_scorer.fit(view_texts, reference_embeddings)
 
     def score(
         self,
         embeddings: np.ndarray,
         view_logits: Optional[torch.Tensor] = None,
+        views: Optional[List[str]] = None,
     ) -> Dict[str, np.ndarray]:
-        """
-        Compute all quality scores for a set of video embeddings.
-
-        Args:
-            embeddings: [N, D] video embeddings
-            view_logits: [N, C] optional view classifier logits
-        Returns:
-            dict with individual signal scores and composite score
-        """
         scores = {}
 
-        # Signal 1: View confidence
+        # Signal 1
         if view_logits is not None:
             scores["view_confidence"] = self.view_scorer.score(view_logits)
         else:
             scores["view_confidence"] = np.ones(len(embeddings))
 
-        # Signal 2: Embedding density
-        scores["embedding_density"] = self.density_scorer.score(embeddings)
+        # Signal 2 (per-view)
+        scores["embedding_density"] = self.density_scorer.score(embeddings, views=views)
 
-        # Signal 3: VL alignment
-        scores["vl_alignment"] = self.vl_scorer.score(embeddings)
+        # Signal 3 (per-view)
+        scores["vl_alignment"] = self.vl_scorer.score(embeddings, views=views)
 
         # Fusion
         scores["composite"] = self.fusion.fuse(scores)
